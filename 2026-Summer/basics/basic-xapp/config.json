@@ -1,0 +1,61 @@
+{
+  "name": "steering-wheel-command-xapp",
+  "xapp_name": "steering-wheel-command-xapp",
+  "version": "1.0.0",
+  "json_url": "steering-wheel-command-xapp",
+  "APP_NAMESPACE": "ricxapp",
+  "CONFIG_PATH": "/ric/v1/config",
+  "controls": {
+    "restHost": "0.0.0.0",
+    "restPort": 8080,
+    "rmrPort": 4562,
+    "waitForRmrReady": false,
+    "useFakeSdl": false,
+    "commandRateHz": 20.0,
+    "deadmanTimeoutMs": 500,
+    "maxCommandAgeMs": 1000,
+    "maxFutureSkewMs": 250,
+    "bounds": {
+      "steeringMin": -1.0,
+      "steeringMax": 1.0,
+      "throttleMin": 0.0,
+      "throttleMax": 1.0,
+      "brakeMin": 0.0,
+      "brakeMax": 1.0,
+      "clampInputs": true
+    },
+    "robot": {
+      "baseUrl": "",
+      "commandPath": "/controller/cmd_vel",
+      "stopPath": "/controller/cmd_vel",
+      "timeoutSeconds": 0.2,
+      "payloadFormat": "rosorin_twist",
+      "maxLinearMps": 0.6,
+      "maxAngularRadps": 1.0
+    }
+  },
+  "messaging": {
+    "ports": [
+      {
+        "name": "http",
+        "container": "steering-wheel-command-xapp",
+        "port": 8080,
+        "description": "REST API port for config, health, and steering command handlers"
+      },
+      {
+        "name": "rmr-data",
+        "container": "steering-wheel-command-xapp",
+        "port": 4562,
+        "description": "RMR port kept for xApp framework health and registration behavior"
+      }
+    ]
+  },
+  "rmr": {
+    "maxSize": 2072,
+    "numWorkers": 1,
+    "policies": [],
+    "protPort": "tcp:4562",
+    "rxMessages": [],
+    "txMessages": []
+  }
+}

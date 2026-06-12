@@ -1,0 +1,59 @@
+{
+  "xapp_name": "steering-wheel-command-xapp",
+  "version": "1.0.0",
+  "json_url": "steering-wheel-command-xapp",
+  "containers": [
+    {
+      "name": "steering-wheel-command-xapp",
+      "image": {
+        "registry": "registry.local:5000",
+        "name": "steering-wheel-command-xapp",
+        "tag": "1.0.0"
+      },
+      "command": [
+        "python3",
+        "/opt/xapp/steering_xapp.py"
+      ]
+    }
+  ],
+  "livenessProbe": {
+    "httpGet": {
+      "path": "/ric/v1/health/alive",
+      "port": 8080
+    },
+    "initialDelaySeconds": 5,
+    "periodSeconds": 15
+  },
+  "readinessProbe": {
+    "httpGet": {
+      "path": "/ric/v1/health/ready",
+      "port": 8080
+    },
+    "initialDelaySeconds": 5,
+    "periodSeconds": 15
+  },
+  "messaging": {
+    "ports": [
+      {
+        "name": "http",
+        "container": "steering-wheel-command-xapp",
+        "port": 8080,
+        "description": "REST API port for config, health, and steering command handlers"
+      },
+      {
+        "name": "rmr-data",
+        "container": "steering-wheel-command-xapp",
+        "port": 4562,
+        "description": "RMR port kept for xApp framework health and registration behavior"
+      }
+    ]
+  },
+  "rmr": {
+    "maxSize": 2072,
+    "numWorkers": 1,
+    "policies": [],
+    "protPort": "tcp:4562",
+    "rxMessages": [],
+    "txMessages": []
+  }
+}
