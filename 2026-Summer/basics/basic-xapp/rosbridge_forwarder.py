@@ -56,9 +56,11 @@ Concept map:
 """
 
 import argparse
+import base64
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, Optional, Tuple
 
 import websocket
 
@@ -88,17 +90,20 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
         This avoids passing those values into every request by hand.
     """
 
-    rosbridge_url = ""
-    # TODO: add default_topic with default "/cmd_vel".
-    # TODO: add timeout with default 0.5.
+    rosbridge_url = "ws://10.45.1.3:9090"
+    default_topic = "/cmd_vel"
+    default_video_topic = "/depth_cam/rgb0/image_raw"
+    timeout = 0.5
 
     def do_GET(self) -> None:
         """
         Handle simple health checks.
 
-        Expected route:
+        Expected routes:
 
             GET /health
+            GET /video/snapshot
+            GET /video/stream
 
         Concept:
 
@@ -114,12 +119,10 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
                 "default_topic": "/cmd_vel"
             }
 
-        ## TODO
-        Implement this flow:
+        Concept:
 
-            1. If `self.path == "/health"`, return status 200.
-            2. Include alive, rosbridge_url, and default_topic in the payload.
-            3. For any other path, return status 404 with `{"error": "not found"}`.
+            The video routes are present but incomplete.  They need ROS image
+            topic subscription logic, so they are the remaining TODO work.
 
         Method-call syntax:
 
@@ -130,7 +133,29 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
             200 -> request worked
             404 -> this path does not exist on this helper
         """
-        # TODO: implement GET /health and 404 behavior.
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send_json(
+                200,
+                {
+                    "alive": True,
+                    "rosbridge_url": self.rosbridge_url,
+                    "default_topic": self.default_topic,
+                    "default_video_topic": self.default_video_topic,
+                },
+            )
+            return
+        if parsed.path == "/video/snapshot":
+            query = parse_qs(parsed.query)
+            topic = query.get("topic", [self.default_video_topic])[0]
+            self._send_json(501, {"error": "video snapshot TODO", "topic": topic})
+            return
+        if parsed.path == "/video/stream":
+            query = parse_qs(parsed.query)
+            topic = query.get("topic", [self.default_video_topic])[0]
+            self._send_json(501, {"error": "video stream TODO", "topic": topic})
+            return
+        self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
         """
@@ -155,8 +180,9 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
             - POST /controller/cmd_vel publishes to /controller/cmd_vel
             - POST / publishes to `self.default_topic`
 
-        ## TODO
-        Implement this flow:
+        Code pattern:
+
+        Implemented flow:
 
             1. Read `Content-Length` from headers.
             2. Read that many bytes from `self.rfile`.
@@ -212,7 +238,21 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
             400 -> request body is bad
             502 -> helper understood the request, but rosbridge publish failed
         """
-        # TODO: implement POST body parsing, Twist validation, publishing, and errors.
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b"{}"
+        topic = self.path if self.path != "/" else self.default_topic
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            twist = self._coerce_twist(payload)
+            self._publish_twist(topic, twist)
+            self._send_json(202, {"accepted": True, "topic": topic, "rosbridge_url": self.rosbridge_url})
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {"error": "invalid JSON body", "detail": str(exc)})
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except Exception as exc:
+            self._send_json(502, {"error": "rosbridge publish failed", "detail": str(exc), "topic": topic})
 
     def log_message(self, fmt: str, *args: Any) -> None:
         """
@@ -269,8 +309,9 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
             For this robot path, most commands only need `linear.x` and
             `angular.z`. The unused directions can safely default to 0.0.
 
-        ## TODO
-        Implement this flow:
+        Code pattern:
+
+        Implemented flow:
 
             1. Read `payload["linear"]`.
             2. Read `payload["angular"]`.
@@ -306,7 +347,23 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
                 "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
             }
         """
-        # TODO: validate and return clean Twist values.
+        try:
+            linear = payload["linear"]
+            angular = payload["angular"]
+            return {
+                "linear": {
+                    "x": float(linear.get("x", 0.0)),
+                    "y": float(linear.get("y", 0.0)),
+                    "z": float(linear.get("z", 0.0)),
+                },
+                "angular": {
+                    "x": float(angular.get("x", 0.0)),
+                    "y": float(angular.get("y", 0.0)),
+                    "z": float(angular.get("z", 0.0)),
+                },
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("body must contain numeric geometry_msgs/Twist linear/angular fields") from exc
 
     def _publish_twist(self, topic: str, twist: Dict[str, Dict[str, float]]) -> None:
         """
@@ -348,8 +405,9 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
                 type    -> ROS message type, for advertise
                 msg     -> actual ROS message payload, for publish
 
-        ## TODO
-        Implement this flow:
+        Code pattern:
+
+        Implemented flow:
 
             1. Make sure the topic starts with `/`.
             2. Save the clean topic name in `ros_topic`.
@@ -403,7 +461,183 @@ class RosbridgeForwarder(BaseHTTPRequestHandler):
             A network send can fail. `finally` still runs after success or
             failure, so the WebSocket connection is closed either way.
         """
-        # TODO: create rosbridge publish message and send it over WebSocket.
+        ros_topic = topic if topic.startswith("/") else f"/{topic}"
+        advertise = {
+            "op": "advertise",
+            "topic": ros_topic,
+            "type": "geometry_msgs/Twist",
+        }
+        message = {
+            "op": "publish",
+            "topic": ros_topic,
+            "msg": twist,
+        }
+        connection = websocket.create_connection(self.rosbridge_url, timeout=self.timeout)
+        try:
+            connection.send(json.dumps(advertise))
+            connection.send(json.dumps(message))
+        finally:
+            connection.close()
+
+    def _read_image(self, topic: str) -> Tuple[bytes, str]:
+        """
+        Read one image message from a ROS image topic through rosbridge.
+
+        Concept:
+
+            A ROS image topic is read by subscribing first, then waiting for a
+            publish message.  After one image arrives, the helper should
+            unsubscribe and close the WebSocket connection.
+
+        Subscribe message syntax:
+
+            subscribe = {
+                "op": "subscribe",
+                "topic": ros_topic,
+                "queue_length": 1,
+                "throttle_rate": 0,
+            }
+
+        ## TODO
+        Subscribe to `topic`, wait for one publish message, convert it with
+        `_image_message_to_bytes`, unsubscribe, and return `(image, content_type)`.
+
+        Topic cleanup syntax:
+
+            ros_topic = topic if topic.startswith("/") else f"/{topic}"
+
+        Receive-loop syntax:
+
+            message = json.loads(connection.recv())
+            if message.get("op") != "publish" or message.get("topic") != ros_topic:
+                continue
+
+        Image conversion syntax:
+
+            image = message.get("msg", {})
+            frame = self._image_message_to_bytes(image)
+            if frame is None:
+                raise ValueError("unsupported image message encoding")
+            return frame
+
+        Cleanup syntax:
+
+            try:
+                connection.send(json.dumps(unsubscribe))
+            except Exception:
+                pass
+            connection.close()
+        """
+        raise NotImplementedError("video snapshot TODO")
+
+    def _stream_images(self, topic: str, fps: float) -> None:
+        """
+        Stream image messages as multipart HTTP frames.
+
+        Concept:
+
+            A multipart stream keeps the HTTP response open.  Each camera frame
+            is written as one part with its own Content-Type and Content-Length.
+
+        Part-writing syntax:
+
+            self.wfile.write(b"--frame\\r\\n")
+            self.wfile.write(f"Content-Type: {content_type}\\r\\n".encode("ascii"))
+            self.wfile.write(f"Content-Length: {len(image)}\\r\\n\\r\\n".encode("ascii"))
+            self.wfile.write(image)
+            self.wfile.write(b"\\r\\n")
+            self.wfile.flush()
+
+        ## TODO
+        Subscribe to the image topic, convert each publish message, and write
+        each converted image as one multipart frame.
+
+        Stream response headers:
+
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+        Subscribe throttle syntax:
+
+            "throttle_rate": int(1000.0 / fps)
+
+        Publish-message check:
+
+            if message.get("op") != "publish" or message.get("topic") != ros_topic:
+                continue
+        """
+        raise NotImplementedError("video stream TODO")
+
+    def _image_message_to_bytes(self, image: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
+        """
+        Convert ROS image message dictionaries into bytes for HTTP.
+
+        Concept:
+
+            ROS image data may arrive as compressed image bytes or raw pixel
+            bytes.  HTTP clients need a recognizable image byte format and a
+            matching Content-Type header.
+
+        Common conversions:
+
+            compressed image -> image/jpeg or application/octet-stream
+            mono8 raw image  -> image/x-portable-graymap
+            rgb8/bgr8 image  -> image/x-portable-pixmap
+
+        ## TODO
+        Handle compressed images and raw `mono8`, `rgb8`, `bgr8`, `rgba8`, and
+        `bgra8` image encodings.
+
+        Compressed image syntax:
+
+            if "format" in image and "data" in image:
+                data = self._decode_ros_binary(image["data"])
+                image_format = str(image.get("format", "")).lower()
+                content_type = "image/jpeg" if "jpg" in image_format or "jpeg" in image_format else "application/octet-stream"
+                return data, content_type
+
+        Raw image fields:
+
+            width = int(image.get("width", 0))
+            height = int(image.get("height", 0))
+            encoding = str(image.get("encoding", "")).lower()
+            data = self._decode_ros_binary(image.get("data", ""))
+
+        PPM/PGM header examples:
+
+            header = f"P5\\n{width} {height}\\n255\\n".encode("ascii")
+            header = f"P6\\n{width} {height}\\n255\\n".encode("ascii")
+        """
+        return None
+
+    @staticmethod
+    def _decode_ros_binary(value: Any) -> bytes:
+        """
+        Decode ROS binary fields.
+
+        Concept:
+
+            rosbridge may represent binary data as a base64 string or as a list
+            of numbers.  Both forms need to become Python `bytes`.
+
+        Complete helper:
+
+            Decode base64 strings, numeric lists, and existing bytes.
+
+        Syntax examples:
+
+            base64.b64decode(value)
+            bytes(int(item) & 0xFF for item in value)
+        """
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return base64.b64decode(value)
+        if isinstance(value, list):
+            return bytes(int(item) & 0xFF for item in value)
+        return b""
 
     def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
         """
@@ -469,8 +703,9 @@ def parse_args() -> argparse.Namespace:
         without changing the code. For example, the robot IP or topic may be
         different on another network.
 
-    ## TODO
-    Add arguments:
+    Code pattern:
+
+    Completed arguments:
 
         --listen-host
         --listen-port
@@ -496,7 +731,12 @@ def parse_args() -> argparse.Namespace:
         return parser.parse_args()
     """
     parser = argparse.ArgumentParser(description="Forward HTTP Twist commands to ROS rosbridge")
-    # TODO: add parser.add_argument(...) calls.
+    parser.add_argument("--listen-host", default="0.0.0.0")
+    parser.add_argument("--listen-port", type=int, default=8090)
+    parser.add_argument("--rosbridge-url", default="ws://10.45.1.3:9090", help="Robot rosbridge URL")
+    parser.add_argument("--default-topic", default="/cmd_vel")
+    parser.add_argument("--default-video-topic", default="/depth_cam/rgb0/image_raw")
+    parser.add_argument("--timeout", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -515,8 +755,9 @@ def main() -> None:
 
         After `serve_forever()` starts, the program waits for HTTP requests.
 
-    ## TODO
-    Implement this flow:
+    Code pattern:
+
+    Implemented flow:
 
         1. Parse command-line arguments.
         2. Copy argument values onto `RosbridgeForwarder` class variables.
@@ -544,7 +785,17 @@ def main() -> None:
         Keep the process running and keep accepting requests until the process
         is stopped.
     """
-    # TODO: parse args, configure handler class, create server, serve forever.
+    args = parse_args()
+    RosbridgeForwarder.rosbridge_url = args.rosbridge_url
+    RosbridgeForwarder.default_topic = args.default_topic
+    RosbridgeForwarder.default_video_topic = args.default_video_topic
+    RosbridgeForwarder.timeout = args.timeout
+    server = ThreadingHTTPServer((args.listen_host, args.listen_port), RosbridgeForwarder)
+    print(
+        f"forwarding http://{args.listen_host}:{args.listen_port} -> {args.rosbridge_url} topic {args.default_topic}",
+        flush=True,
+    )
+    server.serve_forever()
 
 
 if __name__ == "__main__":

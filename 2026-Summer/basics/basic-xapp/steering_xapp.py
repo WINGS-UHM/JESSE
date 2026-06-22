@@ -22,8 +22,10 @@ responses.  The service layer should decide whether commands are valid.
 
 import json
 import os
+import http.server
 from typing import Any, Dict, Optional
 
+import requests
 from google.protobuf.json_format import MessageToDict
 from ricxappframe.rmr import rmr
 from ricxappframe.util.constants import Constants
@@ -34,6 +36,101 @@ from steering_service import SteeringCommandService
 
 
 APP_NAME = "steering-wheel-command-xapp"
+
+
+class SteeringRestHandler(ricrest.RestHandler):
+    """
+    REST handler class used when the video stream route is added.
+
+    Concept:
+
+        Normal JSON routes are registered with `add_handler(...)`.  A streaming
+        route needs direct control over the HTTP response because it sends many
+        chunks over one request.
+
+    ## TODO
+    Complete video stream proxying:
+
+        1. In `do_GET`, detect `/ric/v1/video/stream`.
+        2. Call `_proxy_video_stream(self.xapp)`.
+        3. Use `requests.get(url, stream=True, timeout=(connect_timeout, None))`.
+        4. Forward status, Content-Type, Cache-Control, and stream chunks.
+        5. Handle client disconnects without crashing the xApp.
+
+    Method override syntax:
+
+        def do_GET(self):
+            ...
+
+    Superclass-call syntax:
+
+        super().do_GET()
+
+    Route-detection syntax:
+
+        if self.path.find("/ric/v1/video/stream") >= 0 and self.xapp is not None:
+            self._proxy_video_stream(self.xapp)
+            return
+
+    Response-header syntax:
+
+        self.send_response(upstream.status_code)
+        self.send_header("Content-type", upstream.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"))
+        self.send_header("Cache-Control", upstream.headers.get("Cache-Control", "no-cache"))
+        self.end_headers()
+    """
+
+    xapp: Optional["SteeringXapp"] = None
+
+    def do_GET(self):
+        super().do_GET()
+
+    def _proxy_video_stream(self, app: "SteeringXapp") -> None:
+        """
+        Proxy the robot camera stream through the xApp.
+
+        Concept:
+
+            The wheel client should only need the xApp URL.  This method hides
+            the robot-side video URL behind the xApp REST API.
+
+        ## TODO
+        Use `app.command_service.video_stream_url()` and forward the upstream
+        response bytes to `self.wfile`.
+
+        Stream-copy example:
+
+            for chunk in upstream.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+        Disconnect exception example:
+
+            except (BrokenPipeError, ConnectionResetError):
+                app.logger.info("video stream client disconnected")
+        """
+        payload = json.dumps({"error": "video stream TODO"}).encode("utf-8")
+        self.send_response(501)
+        self.send_header("Content-type", "application/json")
+        self.send_header("Content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class SteeringHTTPServer(ricrest.ThreadedHTTPServer):
+    """
+    REST server class that can use `SteeringRestHandler`.
+
+    Concept:
+
+        `ThreadingHTTPServer` lets a long video stream run without blocking
+        short JSON routes such as `/ric/v1/health/alive`.
+    """
+
+    handler = SteeringRestHandler
+    server_class = http.server.ThreadingHTTPServer
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +188,34 @@ def json_response(status: int = 200, payload: Optional[Any] = None) -> Dict[str,
     return response
 
 
+def binary_response(status: int, payload: bytes, content_type: str) -> Dict[str, Any]:
+    """
+    Build a binary REST response for image snapshot data.
+
+    Concept:
+
+        JSON responses use text payloads.  A camera snapshot uses raw bytes, so
+        the response needs a binary mode and the correct Content-Type.
+
+    ## TODO
+    Complete this helper for:
+
+        GET /ric/v1/video/snapshot
+
+    Reference syntax:
+
+        response = ricrest.initResponse(status=status, response="OK" if status < 400 else "ERROR")
+        response["ctype"] = content_type
+        response["payload"] = payload
+        response["mode"] = "binary"
+        return response
+
+    This uses the same response dictionary style as `json_response`, but the
+    payload stays as bytes instead of using `json.dumps(...)`.
+    """
+    return json_response(status=501, payload={"error": "video snapshot TODO"})
+
+
 def protobuf_to_dict(message: Any) -> Dict[str, Any]:
     """
     Convert framework/RNIB protobuf objects into dictionaries for JSON output.
@@ -121,7 +246,8 @@ def config_change_handler(app: "SteeringXapp", config: Dict[str, Any]) -> None:
     """
     Apply a config update from the xApp framework.
 
-    ## TODO
+    Concept:
+
     Trace the four actions in this function:
 
         1. Save the parsed config on the xApp object.
@@ -160,8 +286,7 @@ class SteeringXapp(RMRXapp):
         """
         Build the xApp.
 
-        ## TODO
-        Complete the startup sequence:
+        Code pattern:
 
             1. Read the config path from `Constants.CONFIG_FILE_ENV`.
             2. Load parsed config with `load_config`.
@@ -190,7 +315,27 @@ class SteeringXapp(RMRXapp):
                 use_fake_sdl=bool(controls.get("useFakeSdl", False)),
             )
         """
-        # TODO: initialize the xApp.
+        config_path = os.environ.get(Constants.CONFIG_FILE_ENV)
+        config = load_config(config_path)
+        self.current_config: Dict[str, Any] = config
+        self.current_config_text = load_config_text(config_path, config)
+        self.rest_server: Optional[ricrest.ThreadedHTTPServer] = None
+        self.command_service = SteeringCommandService(config)
+
+        controls = config.get("controls", {})
+        rmr_port = int(controls.get("rmrPort", 4562))
+
+        super().__init__(
+            default_handler=default_rmr_handler,
+            config_handler=config_change_handler,
+            rmr_port=rmr_port,
+            rmr_wait_for_ready=bool(controls.get("waitForRmrReady", False)),
+            use_fake_sdl=bool(controls.get("useFakeSdl", False)),
+        )
+
+        self.command_service.logger = self.logger
+        start_rest_server(self)
+        self.command_service.start_deadman()
 
     def config_payload(self) -> Dict[str, Any]:
         """
@@ -210,13 +355,22 @@ class SteeringXapp(RMRXapp):
                 }
             ]
         """
-        # TODO: return the config payload.
+        return [
+            {
+                "config": self.current_config_text,
+                "metadata": {
+                    "xappName": self.current_config.get("name", APP_NAME),
+                    "configType": "json",
+                }
+            }
+        ]
 
     def stop(self) -> None:
         """
         Shut down cleanly.
 
-        ## TODO
+        Code pattern:
+
         Suggested cleanup order:
 
             1. Send a stop command through `self.command_service.stop(...)`.
@@ -224,7 +378,11 @@ class SteeringXapp(RMRXapp):
             3. Stop the REST server if it exists.
             4. Call `super().stop()`.
         """
-        # TODO: implement graceful shutdown.
+        self.command_service.stop(reason="xapp_shutdown")
+        self.command_service.stop_deadman()
+        if self.rest_server is not None:
+            self.rest_server.stop()
+        super().stop()
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +398,11 @@ def start_rest_server(app: SteeringXapp) -> None:
         - GET `/ric/v1/health/alive`
         - POST `/ric/v1/steering/command`
 
-    ## TODO
-    Add the remaining routes:
+    Concept:
+
+    This function includes the completed command/control routes.  The video
+    snapshot route is registered, but its helper is intentionally left as video
+    TODO work.  The streaming route needs the custom handler class above.
 
         POST /ric/v1/steering/stop
         GET  /ric/v1/steering/state
@@ -267,7 +428,8 @@ def start_rest_server(app: SteeringXapp) -> None:
     host = controls.get("restHost", "0.0.0.0")
     port = int(controls.get("restPort", 8080))
 
-    server = ricrest.ThreadedHTTPServer(host, port)
+    SteeringRestHandler.xapp = app
+    server = SteeringHTTPServer(host, port)
 
     # GET example: simple health check route.
     server.handler.add_handler(
@@ -287,7 +449,12 @@ def start_rest_server(app: SteeringXapp) -> None:
         rest_post_command(app),
     )
 
-    # TODO: register the remaining routes listed above.
+    server.handler.add_handler(server.handler, "POST", "steering-stop", "/ric/v1/steering/stop", rest_post_stop(app))
+    server.handler.add_handler(server.handler, "GET", "steering-state", "/ric/v1/steering/state", rest_get_steering_state(app))
+    server.handler.add_handler(server.handler, "GET", "video-snapshot", "/ric/v1/video/snapshot", rest_get_video_snapshot(app))
+    server.handler.add_handler(server.handler, "GET", "oran-gnbs", "/ric/v1/oran/gnbs", rest_get_oran_gnbs(app))
+    server.handler.add_handler(server.handler, "GET", "config", "/ric/v1/config", rest_get_config(app))
+    server.handler.add_handler(server.handler, "GET", "ready", "/ric/v1/health/ready", rest_health_ready(app))
 
     server.start()
     app.rest_server = server
@@ -302,7 +469,8 @@ def rest_get_config(app: SteeringXapp):
     """
     Return xApp config.
 
-    ## TODO
+    Code pattern:
+
     Follow the same nested handler pattern used by `rest_health_alive`.
     The returned payload should come from:
 
@@ -310,8 +478,7 @@ def rest_get_config(app: SteeringXapp):
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        # TODO: return `json_response(payload=app.config_payload())`.
-        pass
+        return json_response(payload=app.config_payload())
 
     return handler
 
@@ -335,7 +502,8 @@ def rest_health_ready(app: SteeringXapp):
     """
     Readiness endpoint.
 
-    ## TODO
+    Concept:
+
     Use `app.healthcheck()` so Kubernetes/RIC readiness reflects framework
     dependencies.  Return status 200 when ready and 503 when not ready.
 
@@ -345,8 +513,8 @@ def rest_health_ready(app: SteeringXapp):
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        # TODO: call `app.healthcheck()` and return 200 or 503.
-        pass
+        ready = app.healthcheck()
+        return json_response(status=200 if ready else 503, payload={"ready": ready, "rmr_and_sdl": ready})
 
     return handler
 
@@ -355,15 +523,15 @@ def rest_get_steering_state(app: SteeringXapp):
     """
     Return a snapshot from the command service.
 
-    ## TODO
+    Code pattern:
+
     Do not manually assemble state here.  Let the service expose its own view:
 
         app.command_service.snapshot()
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        # TODO: return the command service snapshot.
-        pass
+        return json_response(payload=app.command_service.snapshot())
 
     return handler
 
@@ -372,7 +540,8 @@ def rest_get_oran_gnbs(app: SteeringXapp):
     """
     Optional ORAN inventory endpoint.
 
-    ## TODO
+    Code pattern:
+
     Implement this flow:
 
         1. Call `app.get_list_gnb_ids()`.
@@ -390,8 +559,14 @@ def rest_get_oran_gnbs(app: SteeringXapp):
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        # TODO: implement optional gNB inventory lookup.
-        pass
+        try:
+            gnb_ids = app.get_list_gnb_ids()
+        except Exception as exc:
+            app.logger.error(f"failed to read gNB IDs from RNIB/SDL: {exc}")
+            return json_response(status=503, payload={"error": "failed to read gNB IDs", "detail": str(exc)})
+
+        gnbs = [protobuf_to_dict(gnb_id) for gnb_id in gnb_ids]
+        return json_response(payload={"count": len(gnbs), "gnbs": gnbs, "source": "RMRXapp.get_list_gnb_ids"})
 
     return handler
 
@@ -437,7 +612,8 @@ def rest_post_stop(app: SteeringXapp):
     """
     Operator stop endpoint.
 
-    ## TODO
+    Code pattern:
+
     Call:
 
         app.command_service.stop(reason="operator")
@@ -446,8 +622,43 @@ def rest_post_stop(app: SteeringXapp):
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        # TODO: call service stop and return JSON response.
-        pass
+        status, payload = app.command_service.stop(reason="operator")
+        return json_response(status=status, payload=payload)
+
+    return handler
+
+
+def rest_get_video_snapshot(app: SteeringXapp):
+    """
+    Return one camera image through the xApp.
+
+    Concept:
+
+        This route should call the service layer because the service owns the
+        robot URL and robot-side paths.  The xApp route only converts the
+        service result into a REST response.
+
+    Function-call syntax from the complete reference:
+
+        status, payload, content_type = app.command_service.video_snapshot()
+        return binary_response(status=status, payload=payload, content_type=content_type)
+
+    Nested handler pattern:
+
+        def handler(_name, _path, _data, _ctype):
+            ...
+
+        return handler
+
+    The snapshot handler follows the same shape as `rest_get_steering_state`,
+    but it returns `binary_response(...)` instead of `json_response(...)`.
+
+    ## TODO
+    Complete the video snapshot route.
+    """
+
+    def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
+        return json_response(status=501, payload={"error": "video snapshot TODO"})
 
     return handler
 
@@ -460,7 +671,8 @@ def main() -> None:
     """
     Program entrypoint.
 
-    ## TODO
+    Code pattern:
+
     Finished solution shape:
 
         app = SteeringXapp()
@@ -468,7 +680,8 @@ def main() -> None:
 
     `thread=False` keeps the xApp in the foreground for container execution.
     """
-    # TODO: create SteeringXapp and run it.
+    app = SteeringXapp()
+    app.run(thread=False, rmr_timeout=5, inotify_timeout=0)
 
 
 if __name__ == "__main__":

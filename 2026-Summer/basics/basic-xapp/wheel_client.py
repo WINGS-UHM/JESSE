@@ -35,12 +35,14 @@ Typical Logitech-style axis model:
 """
 
 import argparse
+import io
 import json
 import signal
+import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pygame
 
@@ -51,14 +53,27 @@ import pygame
 
 DEFAULT_WHEEL_CONFIG = {
     "joystick_index": 0,
-    "xapp_url": "http://127.0.0.1:8080",
-    "rate_hz": 20.0,
-    # TODO: add the remaining default settings from the notes below.
+    "xapp_url": "http://192.168.50.103:18080",
+    "rate_hz": 10.0,
+    "poll_seconds": 0.005,
+    "timeout": 0.2,
+    "video": False,
+    "video_fps": 10.0,
+    "video_timeout": 2.0,
+    "steering_axis": 0,
+    "throttle_axis": 1,
+    "brake_axis": 2,
+    "clutch_axis": 3,
+    "left_paddle_button": 4,
+    "right_paddle_button": 5,
+    "enable_button": -1,
+    "stop_button": -1,
+    "steering_deadzone": 0.03,
+    "pedal_idle_deadzone": 0.05,
 }
 
 """
-## TODO
-Add the remaining keys to `DEFAULT_WHEEL_CONFIG`.
+Concept:
 
 Dictionary syntax:
 
@@ -70,25 +85,14 @@ Examples:
     "timeout": 0.2,
     "steering_axis": 0,
 
-Settings to add:
-
-    poll_seconds: small sleep between pygame polls, default 0.005
-    timeout: HTTP timeout seconds, default 0.2
-    steering_axis: wheel steering axis index, default 0
-    throttle_axis: accelerator pedal axis index, default 1
-    brake_axis: brake pedal axis index, default 2
-    clutch_axis: clutch pedal axis index, default 3
-    left_paddle_button: left paddle button index, default 4
-    right_paddle_button: right paddle button index, default 5
-    enable_button: button that must be held, default -1
-    stop_button: button that stops the client, default -1
-    steering_deadzone: ignore tiny steering movement, default 0.03
-    pedal_idle_deadzone: ignore tiny pedal movement, default 0.05
-
-Why use -1 for buttons?
+Button index concept:
 
     A button index of -1 means "disabled."  For example, if stop_button is -1,
     no wheel button is used as the stop button.
+
+Video settings are included in the dictionary so the command-line parser and
+client object have a clear place to attach video work.  The video methods lower
+in the file are the remaining TODO sections.
 """
 
 
@@ -96,23 +100,13 @@ Why use -1 for buttons?
 # as patterns.  Add the remaining constants after the config dictionary is
 # completed.
 STEERING_AXIS_INDEX = DEFAULT_WHEEL_CONFIG["steering_axis"]
-# TODO: add ACCEL_AXIS_INDEX, BRAKE_AXIS_INDEX, and CLUTCH_AXIS_INDEX.
-# TODO: add LEFT_PADDLE_BUTTON and RIGHT_PADDLE_BUTTON.
-# TODO: add STEERING_DEADZONE and PEDAL_IDLE_DEADZONE.
-#
-# Constant syntax:
-#
-#     CONSTANT_NAME = DEFAULT_WHEEL_CONFIG["config_key"]
-#
-# Example:
-#
-#     ACCEL_AXIS_INDEX = DEFAULT_WHEEL_CONFIG["throttle_axis"]
-#
-# What the square brackets mean:
-#
-#     DEFAULT_WHEEL_CONFIG["throttle_axis"]
-#
-# reads the value stored under the key `"throttle_axis"` in the dictionary.
+ACCEL_AXIS_INDEX = DEFAULT_WHEEL_CONFIG["throttle_axis"]
+BRAKE_AXIS_INDEX = DEFAULT_WHEEL_CONFIG["brake_axis"]
+CLUTCH_AXIS_INDEX = DEFAULT_WHEEL_CONFIG["clutch_axis"]
+LEFT_PADDLE_BUTTON = DEFAULT_WHEEL_CONFIG["left_paddle_button"]
+RIGHT_PADDLE_BUTTON = DEFAULT_WHEEL_CONFIG["right_paddle_button"]
+STEERING_DEADZONE = DEFAULT_WHEEL_CONFIG["steering_deadzone"]
+PEDAL_IDLE_DEADZONE = DEFAULT_WHEEL_CONFIG["pedal_idle_deadzone"]
 
 AXIS_PRECISION = 3
 AXIS_NAMES = ("S", "A", "B", "C")
@@ -147,13 +141,10 @@ def normalize_steering(raw_value: float, deadzone: float = STEERING_DEADZONE, in
         4. If `invert` is True, multiply by -1.
         5. Return the final value.
 
-    Why use a deadzone?
+    Concept:
 
         Real wheels can report tiny values even when nobody is touching them.
         A deadzone prevents tiny noise from becoming robot commands.
-
-    ## TODO
-    Implement the steps above.
 
     Function-call syntax used here:
 
@@ -169,7 +160,12 @@ def normalize_steering(raw_value: float, deadzone: float = STEERING_DEADZONE, in
 
         abs(-0.03) -> 0.03
     """
-    # TODO: normalize steering input.
+    value = clamp(float(raw_value), -1.0, 1.0)
+    if abs(value) < deadzone:
+        value = 0.0
+    if invert:
+        value = -value
+    return value
 
 
 def normalize_pedal(raw_value: float, idle_deadzone: float = PEDAL_IDLE_DEADZONE, invert: bool = False) -> float:
@@ -191,8 +187,7 @@ def normalize_pedal(raw_value: float, idle_deadzone: float = PEDAL_IDLE_DEADZONE
         raw  0.0 -> pressed 0.5
         raw -1.0 -> pressed 1.0
 
-    ## TODO
-    Implement this flow:
+    Code pattern:
 
         1. Convert raw value to float.
         2. Clamp it between -1.0 and 1.0.
@@ -216,7 +211,11 @@ def normalize_pedal(raw_value: float, idle_deadzone: float = PEDAL_IDLE_DEADZONE
 
         return pressed
     """
-    # TODO: normalize pedal input.
+    value = clamp(float(raw_value), -1.0, 1.0)
+    if invert:
+        value = -value
+    pressed = clamp((1.0 - value) / 2.0, 0.0, 1.0)
+    return 0.0 if pressed < idle_deadzone else pressed
 
 
 def read_state(joystick: Any) -> Tuple[List[float], List[int], List[Tuple[int, int]]]:
@@ -239,8 +238,7 @@ def read_state(joystick: Any) -> Tuple[List[float], List[int], List[Tuple[int, i
         buttons -> list of 0/1 values
         hats    -> list of directional pad tuples
 
-    ## TODO
-    Use list comprehensions to build each list.
+    Code pattern:
 
     Axis example:
 
@@ -272,7 +270,19 @@ def read_state(joystick: Any) -> Tuple[List[float], List[int], List[Tuple[int, i
 
         0, 1, 2, ... up to one less than the number of axes
     """
-    # TODO: read axes, buttons, and hats from pygame.
+    axes = [
+        round(float(joystick.get_axis(index)), AXIS_PRECISION)
+        for index in range(joystick.get_numaxes())
+    ]
+    buttons = [
+        int(joystick.get_button(index))
+        for index in range(joystick.get_numbuttons())
+    ]
+    hats = [
+        joystick.get_hat(index)
+        for index in range(joystick.get_numhats())
+    ]
+    return axes, buttons, hats
 
 
 def axis_value(axes: Sequence[float], index: int, default: float) -> float:
@@ -290,8 +300,7 @@ def button_value(buttons: Sequence[int], index: int, default: int = 0) -> int:
     """
     Safely read one button.
 
-    ## TODO
-    Follow the same pattern as `axis_value`.
+    Code pattern:
 
     Sequence indexing syntax:
 
@@ -305,7 +314,7 @@ def button_value(buttons: Sequence[int], index: int, default: int = 0) -> int:
 
         return buttons[index] if 0 <= index < len(buttons) else default
     """
-    # TODO: return the button value or the default.
+    return buttons[index] if 0 <= index < len(buttons) else default
 
 
 def format_axes(axes: Sequence[float]) -> str:
@@ -316,7 +325,8 @@ def format_axes(axes: Sequence[float]) -> str:
 
         S=+0.000 A=+1.000 B=+1.000 C=+1.000
 
-    ## TODO
+    Code pattern:
+
     Loop through axes with `enumerate`.
     Use `AXIS_NAMES` for known axes.
     Use `X{index}` for extra axes.
@@ -343,7 +353,11 @@ def format_axes(axes: Sequence[float]) -> str:
 
     `+.3f` means show a sign and three digits after the decimal point.
     """
-    # TODO: format axis values as a single string.
+    parts = []
+    for index, value in enumerate(axes):
+        name = AXIS_NAMES[index] if index < len(AXIS_NAMES) else f"X{index}"
+        parts.append(f"{name}={value:+.3f}")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +381,7 @@ class WheelClient:
         """
         Save command-line settings and build xApp URLs.
 
-        ## TODO
-        Initialize:
+        Code pattern:
 
             self.args
             self.seq
@@ -396,7 +409,19 @@ class WheelClient:
         `.rstrip("/")` removes trailing slash characters from the right side of
         the URL so paths can be joined cleanly.
         """
-        # TODO: initialize the client object.
+        self.args = args
+        self.seq = 0
+        self.keep_running = True
+        base = args.xapp_url.rstrip("/")
+        self.command_url = base + "/ric/v1/steering/command"
+        self.stop_url = base + "/ric/v1/steering/stop"
+        self.video_url = args.video_url or (base + "/ric/v1/video/stream")
+        self.video_lock = threading.Lock()
+        self.video_frame: Optional[bytes] = None
+        self.video_frame_id = 0
+        self.video_drawn_id = -1
+        self.video_window_started = False
+        self.video_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
         """
@@ -409,7 +434,7 @@ class WheelClient:
             3. Check that at least one joystick exists.
             4. Open the selected joystick.
             5. Print basic wheel information.
-            6. Repeatedly pump pygame events.
+            6. Pump pygame events each loop.
             7. Read wheel state.
             8. Send commands at `rate_hz`.
             9. Stop if the stop button is requested.
@@ -417,13 +442,10 @@ class WheelClient:
             11. Always send a final stop command.
             12. Always call `pygame.quit()`.
 
-        Why `try/finally`?
+        Concept:
 
             The final stop command and pygame cleanup should happen even if the
             loop exits because of Ctrl+C or another shutdown signal.
-
-        ## TODO
-        Implement the flow above.
 
         Useful snippets:
 
@@ -470,7 +492,191 @@ class WheelClient:
                 self.send_stop()
                 pygame.quit()
         """
-        # TODO: implement pygame setup, polling loop, command sending, cleanup.
+        pygame.init()
+        pygame.joystick.init()
+        if pygame.joystick.get_count() == 0:
+            raise SystemExit("No joystick or wheel detected by pygame.")
+
+        joystick = pygame.joystick.Joystick(self.args.joystick_index)
+        joystick.init()
+        print(
+            f"Using {joystick.get_name()} "
+            f"axes={joystick.get_numaxes()} buttons={joystick.get_numbuttons()} hats={joystick.get_numhats()}"
+        )
+        if self.args.video:
+            self.start_video()
+
+        next_send = 0.0
+        try:
+            while self.keep_running:
+                self.handle_pygame_events()
+                self.draw_video_frame()
+                axes, buttons, hats = read_state(joystick)
+                now = time.monotonic()
+                if now >= next_send:
+                    command = self.build_command(axes, buttons)
+                    response = self._post_json(self.command_url, command)
+                    if self.args.print_commands:
+                        print(f"seq={command['seq']} axes={format_axes(axes)} cmd={json.dumps(command, sort_keys=True)}")
+                    if response is not None:
+                        self.print_json_response("command", response)
+                    next_send = time.monotonic() + (1.0 / self.args.rate_hz)
+                if self.stop_requested(buttons, hats):
+                    self.keep_running = False
+                time.sleep(self.args.poll_seconds)
+        finally:
+            self.send_stop()
+            pygame.quit()
+
+    def start_video(self) -> None:
+        """
+        Start the robot camera window and background video thread.
+
+        Concept:
+
+            Command sending and frame fetching run at the same time.  A thread
+            lets video network reads happen without blocking wheel commands.
+
+        Function syntax from the complete reference:
+
+            pygame.display.set_caption("Robot camera")
+            pygame.display.set_mode((640, 480), pygame.RESIZABLE)
+            self.video_thread = threading.Thread(target=self.video_loop, daemon=True)
+            self.video_thread.start()
+
+        Attribute updates:
+
+            self.video_window_started = True
+
+        Terminal message example:
+
+            print(f"Video window started from {self.video_url}")
+
+        ## TODO
+        Complete the video startup logic.
+        """
+        print("video streaming TODO: start_video")
+
+    def handle_pygame_events(self) -> None:
+        """
+        Process pygame window events.
+
+        Concept:
+
+            If the video window is open, pygame sends a `pygame.QUIT` event
+            when the window close button is pressed.
+
+        Event-loop syntax:
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.keep_running = False
+
+        ## TODO
+        Complete video window event handling.
+        """
+        pygame.event.pump()
+
+    def video_loop(self) -> None:
+        """
+        Fetch camera frames in the background.
+
+        Concept:
+
+            A snapshot URL returns one image per GET request.  A stream URL
+            keeps one HTTP response open and sends many image parts.
+
+        ## TODO
+        Decide whether `self.video_url` is a stream or snapshot URL and call
+        the matching helper.
+
+        Stream check example:
+
+            if "/stream" in self.video_url:
+                self.video_stream_loop()
+                return
+
+        Snapshot timing example:
+
+            frame_interval = 1.0 / self.args.video_fps
+            started = time.monotonic()
+            elapsed = time.monotonic() - started
+            time.sleep(max(frame_interval - elapsed, 0.001))
+
+        Shared-frame update syntax:
+
+            with self.video_lock:
+                self.video_frame = frame
+                self.video_frame_id += 1
+        """
+        return
+
+    def video_stream_loop(self) -> None:
+        """
+        Read a multipart camera stream.
+
+        Concept:
+
+            `multipart/x-mixed-replace` is one HTTP response containing many
+            parts.  Each part has small headers followed by one image frame.
+
+        Request syntax from the complete reference:
+
+            urllib.request.Request(
+                self.video_url,
+                headers={"Accept": "multipart/x-mixed-replace,image/jpeg"},
+            )
+
+        ## TODO
+        Open the stream, read chunks, and pass bytes into
+        `extract_multipart_frames`.
+
+        Open-response syntax:
+
+            with urllib.request.urlopen(request, timeout=self.args.video_timeout) as response:
+                boundary = self.multipart_boundary(response.headers.get("Content-Type", "")) or b"--frame"
+                buffer = b""
+
+        Read-loop syntax:
+
+            chunk = response.read(8192)
+            if not chunk:
+                return
+            buffer += chunk
+            buffer = self.extract_multipart_frames(buffer, boundary)
+        """
+        return
+
+    def draw_video_frame(self) -> None:
+        """
+        Draw the newest camera frame into the pygame window.
+
+        Concept:
+
+            `pygame.image.load(io.BytesIO(frame))` turns image bytes into a
+            pygame image surface.  The surface can then be scaled and drawn.
+
+        ## TODO
+        Decode `self.video_frame`, scale it to the window size, draw it, and
+        call `pygame.display.flip()`.
+
+        Lock-and-skip syntax:
+
+            with self.video_lock:
+                if self.video_frame is None or self.video_frame_id == self.video_drawn_id:
+                    return
+                frame = self.video_frame
+                frame_id = self.video_frame_id
+
+        Draw syntax:
+
+            image = pygame.image.load(io.BytesIO(frame))
+            window = pygame.display.get_surface()
+            scaled = pygame.transform.smoothscale(image.convert(), window.get_size())
+            window.blit(scaled, (0, 0))
+            pygame.display.flip()
+        """
+        return
 
     def build_command(self, axes: Sequence[float], buttons: Sequence[int]) -> Dict[str, Any]:
         """
@@ -485,8 +691,7 @@ class WheelClient:
             brake: normalized brake pedal value
             enable: True/False
 
-        ## TODO
-        Implement this flow:
+        Code pattern:
 
             1. Start with `enable = True`.
             2. If `self.args.enable_button >= 0`, read that button.
@@ -529,7 +734,42 @@ class WheelClient:
 
             self.seq = self.seq + 1
         """
-        # TODO: build and return one command dictionary.
+        enable = True
+        if self.args.enable_button >= 0:
+            enable = bool(button_value(buttons, self.args.enable_button, default=0))
+
+        command = {
+            "seq": self.seq,
+            "timestamp_ms": self.command_time_ms(),
+            "steering": normalize_steering(
+                axis_value(axes, self.args.steering_axis, 0.0),
+                deadzone=self.args.steering_deadzone,
+                invert=self.args.invert_steering,
+            ),
+            "throttle": normalize_pedal(
+                axis_value(axes, self.args.throttle_axis, 1.0),
+                idle_deadzone=self.args.pedal_idle_deadzone,
+                invert=self.args.invert_throttle,
+            ),
+            "brake": normalize_pedal(
+                axis_value(axes, self.args.brake_axis, 1.0),
+                idle_deadzone=self.args.pedal_idle_deadzone,
+                invert=self.args.invert_brake,
+            ),
+            "enable": enable,
+        }
+        self.seq += 1
+        return command
+
+    def command_time_ms(self) -> int:
+        """
+        Return current wall-clock time in milliseconds.
+
+        Code pattern:
+
+            int(time.time() * 1000)
+        """
+        return int(time.time() * 1000)
 
     def stop_requested(self, buttons: Sequence[int], _hats: Sequence[Tuple[int, int]]) -> bool:
         """
@@ -537,8 +777,7 @@ class WheelClient:
 
         If `self.args.stop_button` is -1, no stop button is configured.
 
-        ## TODO
-        Use `button_value` to safely read the stop button.
+        Code pattern:
 
         Boolean syntax:
 
@@ -552,7 +791,7 @@ class WheelClient:
 
         `bool(...)` converts 0 to False and 1 to True.
         """
-        # TODO: return whether stop was requested.
+        return self.args.stop_button >= 0 and bool(button_value(buttons, self.args.stop_button, default=0))
 
     def send_stop(self) -> None:
         """
@@ -564,7 +803,8 @@ class WheelClient:
 
         The body can be an empty dictionary.
 
-        ## TODO
+        Code pattern:
+
         Call `_post_json(self.stop_url, {})`.
         Print a short success message.
         Catch exceptions and print a short failure message.
@@ -584,9 +824,15 @@ class WheelClient:
             except Exception as exc:
                 print(f"stop request failed: {exc}")
         """
-        # TODO: send final stop request.
+        try:
+            response = self._post_json(self.stop_url, {})
+            print("Sent stop command.")
+            if response is not None:
+                self.print_json_response("stop", response)
+        except Exception as exc:
+            print(f"stop request failed: {exc}")
 
-    def _post_json(self, url: str, payload: Dict[str, Any]) -> None:
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> Any:
         """
         Send one HTTP POST request with a JSON body.
 
@@ -610,8 +856,7 @@ class WheelClient:
                 method="POST",
             )
 
-        ## TODO
-        Implement the request and error handling.
+        Code pattern:
 
         JSON syntax:
 
@@ -644,7 +889,143 @@ class WheelClient:
             except urllib.error.URLError as exc:
                 ...
         """
-        # TODO: POST JSON to the xApp.
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.args.timeout) as response:
+                body = response.read().decode("utf-8", "replace")
+                parsed = self.parse_json_body(body)
+                if response.status >= 400:
+                    print(f"POST {url} returned {response.status}:")
+                    self.print_json_response("error", parsed if parsed is not None else body)
+                return parsed
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            parsed = self.parse_json_body(body)
+            print(f"POST {url} returned {exc.code}:")
+            self.print_json_response("error", parsed if parsed is not None else body)
+            return None
+        except urllib.error.URLError as exc:
+            print(f"POST {url} failed: {exc}")
+            return None
+        except TimeoutError as exc:
+            print(f"POST {url} timed out: {exc}")
+            return None
+        except OSError as exc:
+            print(f"POST {url} failed: {exc}")
+            return None
+
+    def _get_bytes(self, url: str, timeout: float) -> Optional[bytes]:
+        """
+        Fetch one binary response from a URL.
+
+        Concept:
+
+            Images are bytes, so this helper returns `bytes` instead of a JSON
+            dictionary.
+
+        ## TODO
+        Use `urllib.request.urlopen` to read one snapshot image.
+
+        Request syntax:
+
+            request = urllib.request.Request(
+                url,
+                headers={"Accept": "image/jpeg,image/png,image/x-portable-pixmap,image/x-portable-graymap"},
+            )
+
+        Read syntax:
+
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+
+        Error handling can follow the same `urllib.error.HTTPError`,
+        `urllib.error.URLError`, `TimeoutError`, and `OSError` structure used in
+        `_post_json`.
+        """
+        return None
+
+    def extract_multipart_frames(self, buffer: bytes, boundary: bytes) -> bytes:
+        """
+        Extract image frames from a multipart stream buffer.
+
+        Concept:
+
+            Network reads may stop in the middle of a frame.  This function
+            should keep unfinished bytes in `buffer` and only store complete
+            image frames.
+
+        ## TODO
+        Search for the boundary marker, split complete parts, and store the
+        newest image bytes in `self.video_frame`.
+
+        Boundary search syntax:
+
+            start = buffer.find(boundary)
+            next_start = buffer.find(boundary, start + len(boundary))
+
+        Header/body split syntax:
+
+            header_end = part.find(b"\\r\\n\\r\\n")
+            frame = part[header_end + 4:].strip(b"\\r\\n")
+
+        Shared-frame update syntax:
+
+            with self.video_lock:
+                self.video_frame = frame
+                self.video_frame_id += 1
+        """
+        return buffer
+
+    @staticmethod
+    def multipart_boundary(content_type: str) -> Optional[bytes]:
+        """
+        Read the boundary token from a multipart Content-Type header.
+
+        Header example:
+
+            multipart/x-mixed-replace; boundary=frame
+
+        ## TODO
+        Parse the `boundary=...` value and return it as bytes with a leading
+        `--`.
+
+        Header parsing syntax:
+
+            for item in content_type.split(";"):
+                key, _, value = item.strip().partition("=")
+
+        Boundary token syntax:
+
+            token = value.strip().strip('"')
+            if not token.startswith("--"):
+                token = "--" + token
+            return token.encode("ascii", "ignore")
+        """
+        return None
+
+    @staticmethod
+    def parse_json_body(body: str) -> Any:
+        """
+        Convert response text into JSON when possible.
+        """
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except ValueError:
+            return body
+
+    @staticmethod
+    def print_json_response(label: str, payload: Any) -> None:
+        """
+        Print JSON responses in a readable format.
+        """
+        print(f"{label} response:")
+        if isinstance(payload, (dict, list)):
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -661,27 +1042,10 @@ def parse_args() -> argparse.Namespace:
         python3 wheel_client.py --rate-hz 10
         python3 wheel_client.py --print-commands
 
-    The first argument is completed as the pattern.  Add the rest from the TODO
-    list.
+    Concept:
 
-    ## TODO
-    Add arguments for:
-
-        --xapp-url
-        --rate-hz
-        --poll-seconds
-        --timeout
-        --steering-axis
-        --throttle-axis
-        --brake-axis
-        --enable-button
-        --stop-button
-        --steering-deadzone
-        --pedal-idle-deadzone
-        --invert-steering
-        --invert-throttle
-        --invert-brake
-        --print-commands
+        The movement arguments are complete.  The video arguments are present
+        so the remaining video TODO methods have command-line settings to use.
     """
     parser = argparse.ArgumentParser(description="Logitech wheel client for the steering xApp")
     parser.add_argument(
@@ -690,24 +1054,32 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_WHEEL_CONFIG["joystick_index"],
         help="pygame joystick index",
     )
-    # TODO: add the remaining parser.add_argument(...) calls.
-    #
-    # argparse syntax:
-    #
-    #     parser.add_argument("--name", type=some_type, default=value, help="text")
-    #
-    # Examples:
-    #
-    #     parser.add_argument("--rate-hz", type=float, default=20.0)
-    #     parser.add_argument("--xapp-url", default="http://127.0.0.1:8080")
-    #
-    # Boolean flag syntax:
-    #
-    #     parser.add_argument("--print-commands", action="store_true")
-    #
-    # `action="store_true"` means the value is False unless the flag appears on
-    # the command line.
-    return parser.parse_args()
+    parser.add_argument("--xapp-url", default=DEFAULT_WHEEL_CONFIG["xapp_url"], help="Base URL for the steering xApp")
+    parser.add_argument("--rate-hz", type=float, default=DEFAULT_WHEEL_CONFIG["rate_hz"], help="Command publish rate")
+    parser.add_argument("--poll-seconds", type=float, default=DEFAULT_WHEEL_CONFIG["poll_seconds"], help="pygame polling delay")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_WHEEL_CONFIG["timeout"], help="HTTP timeout seconds")
+    parser.add_argument("--video", dest="video", action="store_true", default=DEFAULT_WHEEL_CONFIG["video"], help="Open a live robot camera window")
+    parser.add_argument("--no-video", dest="video", action="store_false", help="Disable the robot camera window")
+    parser.add_argument("--video-url", default=None, help="Override video stream or snapshot URL")
+    parser.add_argument("--video-fps", type=float, default=DEFAULT_WHEEL_CONFIG["video_fps"], help="Video snapshot fetch rate")
+    parser.add_argument("--video-timeout", type=float, default=DEFAULT_WHEEL_CONFIG["video_timeout"], help="Video HTTP timeout seconds")
+    parser.add_argument("--steering-axis", type=int, default=DEFAULT_WHEEL_CONFIG["steering_axis"])
+    parser.add_argument("--throttle-axis", type=int, default=DEFAULT_WHEEL_CONFIG["throttle_axis"])
+    parser.add_argument("--brake-axis", type=int, default=DEFAULT_WHEEL_CONFIG["brake_axis"])
+    parser.add_argument("--enable-button", type=int, default=DEFAULT_WHEEL_CONFIG["enable_button"], help="Button that must be held; -1 always enables")
+    parser.add_argument("--stop-button", type=int, default=DEFAULT_WHEEL_CONFIG["stop_button"], help="Button that stops the client and sends xApp stop")
+    parser.add_argument("--steering-deadzone", type=float, default=DEFAULT_WHEEL_CONFIG["steering_deadzone"])
+    parser.add_argument("--pedal-idle-deadzone", type=float, default=DEFAULT_WHEEL_CONFIG["pedal_idle_deadzone"])
+    parser.add_argument("--invert-steering", action="store_true")
+    parser.add_argument("--invert-throttle", action="store_true", help="Use if the pedal reports idle -1 and pressed +1")
+    parser.add_argument("--invert-brake", action="store_true", help="Use if the pedal reports idle -1 and pressed +1")
+    parser.add_argument("--print-commands", action="store_true", help="Print axes and JSON command payloads while sending")
+    args = parser.parse_args()
+    if args.rate_hz <= 0:
+        parser.error("--rate-hz must be greater than 0")
+    if args.video_fps <= 0:
+        parser.error("--video-fps must be greater than 0")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -718,8 +1090,7 @@ def main() -> None:
     """
     Program entrypoint.
 
-    ## TODO
-    Implement this flow:
+    Code pattern:
 
         1. Parse arguments.
         2. Create `WheelClient(args)`.
@@ -727,7 +1098,7 @@ def main() -> None:
         4. Register that function for SIGINT and SIGTERM.
         5. Call `client.run()`.
 
-    Why signals?
+    Concept:
 
         SIGINT usually comes from Ctrl+C.
         SIGTERM is commonly used by tools that ask a program to shut down.
@@ -750,7 +1121,15 @@ def main() -> None:
 
         client.run()
     """
-    # TODO: parse args, create client, register signals, run client.
+    args = parse_args()
+    client = WheelClient(args)
+
+    def stop(_signum, _frame) -> None:
+        client.keep_running = False
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    client.run()
 
 
 if __name__ == "__main__":
