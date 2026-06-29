@@ -48,8 +48,7 @@ class SteeringRestHandler(ricrest.RestHandler):
         route needs direct control over the HTTP response because it sends many
         chunks over one request.
 
-    ## TODO
-    Complete video stream proxying:
+    Completed video stream proxying:
 
         1. In `do_GET`, detect `/ric/v1/video/stream`.
         2. Call `_proxy_video_stream(self.xapp)`.
@@ -83,6 +82,9 @@ class SteeringRestHandler(ricrest.RestHandler):
     xapp: Optional["SteeringXapp"] = None
 
     def do_GET(self):
+        if self.path.find("/ric/v1/video/stream") >= 0 and self.xapp is not None:
+            self._proxy_video_stream(self.xapp)
+            return
         super().do_GET()
 
     def _proxy_video_stream(self, app: "SteeringXapp") -> None:
@@ -94,9 +96,12 @@ class SteeringRestHandler(ricrest.RestHandler):
             The wheel client should only need the xApp URL.  This method hides
             the robot-side video URL behind the xApp REST API.
 
-        ## TODO
-        Use `app.command_service.video_stream_url()` and forward the upstream
-        response bytes to `self.wfile`.
+        Completed flow:
+
+            1. Ask the service for the robot-side video stream URL.
+            2. Open a streaming GET request to that URL.
+            3. Copy response headers that matter to video clients.
+            4. Forward each incoming chunk to this HTTP response.
 
         Stream-copy example:
 
@@ -111,12 +116,32 @@ class SteeringRestHandler(ricrest.RestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 app.logger.info("video stream client disconnected")
         """
-        payload = json.dumps({"error": "video stream TODO"}).encode("utf-8")
-        self.send_response(501)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        url = app.command_service.video_stream_url()
+        connect_timeout = max(app.command_service.robot.timeout_seconds, 2.0)
+        try:
+            with requests.get(url, stream=True, timeout=(connect_timeout, None)) as upstream:
+                self.send_response(upstream.status_code)
+                self.send_header("Content-type", upstream.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"))
+                self.send_header("Cache-Control", upstream.headers.get("Cache-Control", "no-cache"))
+                self.end_headers()
+                for chunk in upstream.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            app.logger.info("video stream client disconnected")
+        except requests.RequestException as exc:
+            app.logger.error(f"video stream proxy failed: {exc}")
+            payload = json.dumps({"error": "video stream proxy failed", "detail": str(exc)}).encode("utf-8")
+            try:
+                self.send_response(502)
+                self.send_header("Content-type", "application/json")
+                self.send_header("Content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                app.logger.info("video stream client disconnected")
 
 
 class SteeringHTTPServer(ricrest.ThreadedHTTPServer):
@@ -197,8 +222,7 @@ def binary_response(status: int, payload: bytes, content_type: str) -> Dict[str,
         JSON responses use text payloads.  A camera snapshot uses raw bytes, so
         the response needs a binary mode and the correct Content-Type.
 
-    ## TODO
-    Complete this helper for:
+    Completed helper for:
 
         GET /ric/v1/video/snapshot
 
@@ -213,7 +237,11 @@ def binary_response(status: int, payload: bytes, content_type: str) -> Dict[str,
     This uses the same response dictionary style as `json_response`, but the
     payload stays as bytes instead of using `json.dumps(...)`.
     """
-    return json_response(status=501, payload={"error": "video snapshot TODO"})
+    response = ricrest.initResponse(status=status, response="OK" if status < 400 else "ERROR")
+    response["ctype"] = content_type
+    response["payload"] = payload
+    response["mode"] = "binary"
+    return response
 
 
 def protobuf_to_dict(message: Any) -> Dict[str, Any]:
@@ -400,9 +428,9 @@ def start_rest_server(app: SteeringXapp) -> None:
 
     Concept:
 
-    This function includes the completed command/control routes.  The video
-    snapshot route is registered, but its helper is intentionally left as video
-    TODO work.  The streaming route needs the custom handler class above.
+    This function includes the completed command/control and video routes.  The
+    servo-arm routes are registered so their service-layer TODO sections can be
+    completed in `steering_service.py`.
 
         POST /ric/v1/steering/stop
         GET  /ric/v1/steering/state
@@ -452,6 +480,8 @@ def start_rest_server(app: SteeringXapp) -> None:
     server.handler.add_handler(server.handler, "POST", "steering-stop", "/ric/v1/steering/stop", rest_post_stop(app))
     server.handler.add_handler(server.handler, "GET", "steering-state", "/ric/v1/steering/state", rest_get_steering_state(app))
     server.handler.add_handler(server.handler, "GET", "video-snapshot", "/ric/v1/video/snapshot", rest_get_video_snapshot(app))
+    server.handler.add_handler(server.handler, "POST", "arm-pose", "/ric/v1/arm/pose", rest_post_arm_pose(app))
+    server.handler.add_handler(server.handler, "GET", "arm-state", "/ric/v1/arm/state", rest_get_arm_state(app))
     server.handler.add_handler(server.handler, "GET", "oran-gnbs", "/ric/v1/oran/gnbs", rest_get_oran_gnbs(app))
     server.handler.add_handler(server.handler, "GET", "config", "/ric/v1/config", rest_get_config(app))
     server.handler.add_handler(server.handler, "GET", "ready", "/ric/v1/health/ready", rest_health_ready(app))
@@ -628,6 +658,71 @@ def rest_post_stop(app: SteeringXapp):
     return handler
 
 
+def rest_post_arm_pose(app: SteeringXapp):
+    """
+    POST one servo-arm pose command.
+
+    Expected request body:
+
+        {
+            "duration": 0.2,
+            "positions": [
+                {"id": 1, "position": 500}
+            ]
+        }
+
+    Concept:
+
+        This REST handler should look like `rest_post_command`: decode the JSON
+        body, pass the dictionary to the service, and return the service result
+        as JSON.
+
+    JSON decode syntax:
+
+        body = decode_json_body(data)
+
+    Service-call syntax:
+
+        status, payload = app.command_service.submit_arm_pose(body)
+
+    Route wiring is complete here.  The servo-arm validation and forwarding
+    work is in `steering_service.py` and `rosbridge_forwarder.py`.
+    """
+
+    def handler(_name: str, _path: str, data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
+        try:
+            body = decode_json_body(data)
+        except ValueError as exc:
+            return json_response(status=400, payload={"error": str(exc)})
+        status, payload = app.command_service.submit_arm_pose(body)
+        return json_response(status=status, payload=payload)
+
+    return handler
+
+
+def rest_get_arm_state(app: SteeringXapp):
+    """
+    GET the current servo-arm state.
+
+    Concept:
+
+        This follows the same route shape as `rest_get_steering_state`, but it
+        calls the arm-specific service method.
+
+    Service-call syntax:
+
+        app.command_service.arm_snapshot()
+
+    Route wiring is complete here.  Add extra arm state fields in
+    `SteeringCommandService.arm_snapshot()` when the controller needs them.
+    """
+
+    def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
+        return json_response(payload=app.command_service.arm_snapshot())
+
+    return handler
+
+
 def rest_get_video_snapshot(app: SteeringXapp):
     """
     Return one camera image through the xApp.
@@ -653,12 +748,12 @@ def rest_get_video_snapshot(app: SteeringXapp):
     The snapshot handler follows the same shape as `rest_get_steering_state`,
     but it returns `binary_response(...)` instead of `json_response(...)`.
 
-    ## TODO
-    Complete the video snapshot route.
+    Completed video snapshot route.
     """
 
     def handler(_name: str, _path: str, _data: Optional[bytes], _ctype: str) -> Dict[str, Any]:
-        return json_response(status=501, payload={"error": "video snapshot TODO"})
+        status, payload, content_type = app.command_service.video_snapshot()
+        return binary_response(status=status, payload=payload, content_type=content_type)
 
     return handler
 

@@ -38,6 +38,23 @@ DEFAULT_ROBOT_MAX_LINEAR_MPS = 0.2
 DEFAULT_ROBOT_MAX_ANGULAR_RADPS = 0.5
 DEFAULT_ROBOT_TIMEOUT_SECONDS = 0.5
 
+# Servo-arm reference values.
+#
+# Concept:
+#
+#     The arm controller expects a servo id and a pulse position.  The complete
+#     reference file uses these dictionaries to remember the default position
+#     and the allowed min/max range for each servo.
+#
+# Dictionary syntax:
+#
+#     key: value
+#
+# One completed example is left below. Add the remaining servo ids by following
+# the same pattern from `steering_service_og.py`.
+DEFAULT_ARM_POSITIONS = {1: 500}
+DEFAULT_ARM_LIMITS = {1: (0, 1000)}
+
 
 def now_ms() -> int:
     """
@@ -113,14 +130,14 @@ class RobotTarget:
         `stop_path` are joined onto that base URL for POST requests.
 
         Video uses two extra paths.  Those fields are included here so the
-        config shape is visible, but the methods that use them are left as the
-        remaining video work lower in the file.
+        config shape is visible.  Servo-arm movement uses `arm_pose_path`.
     """
     base_url: str = DEFAULT_ROBOT_BASE_URL
     command_path: str = "/cmd_vel"
     stop_path: str = "/cmd_vel"
     video_snapshot_path: str = "/video/snapshot"
     video_stream_path: str = "/video/stream"
+    arm_pose_path: str = "/arm/pose"
     timeout_seconds: float = DEFAULT_ROBOT_TIMEOUT_SECONDS
     payload_format: str = DEFAULT_ROBOT_PAYLOAD_FORMAT
     max_linear_mps: float = DEFAULT_ROBOT_MAX_LINEAR_MPS
@@ -191,6 +208,11 @@ class SteeringCommandService:
         self.logger = logger
         self.lock = threading.Lock()
         self.state = SteeringState()
+        self.arm_positions = DEFAULT_ARM_POSITIONS.copy()
+        self.arm_last_robot_status: Optional[Dict[str, Any]] = None
+        self.arm_command_count = 0
+        self.arm_last_error: Optional[str] = None
+        self.arm_last_command_ms: Optional[int] = None
         self.deadman_thread: Optional[threading.Thread] = None
         self.keep_running = False
         self.apply_config(config)
@@ -248,6 +270,7 @@ class SteeringCommandService:
             stop_path=str(robot.get("stopPath", robot.get("commandPath", "/cmd_vel"))),
             video_snapshot_path=str(robot.get("videoSnapshotPath", "/video/snapshot")),
             video_stream_path=str(robot.get("videoStreamPath", "/video/stream")),
+            arm_pose_path=str(robot.get("armPosePath", "/arm/pose")),
             timeout_seconds=float(robot.get("timeoutSeconds", DEFAULT_ROBOT_TIMEOUT_SECONDS)),
             payload_format=str(robot.get("payloadFormat", DEFAULT_ROBOT_PAYLOAD_FORMAT)),
             max_linear_mps=float(robot.get("maxLinearMps", DEFAULT_ROBOT_MAX_LINEAR_MPS)),
@@ -446,6 +469,126 @@ class SteeringCommandService:
                 "state": self.state.__dict__.copy(),
             }
 
+    def submit_arm_pose(self, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """
+        Accept one servo-arm pose request.
+
+        Expected incoming body:
+
+            {
+                "duration": 0.2,
+                "positions": [
+                    {"id": 1, "position": 500}
+                ]
+            }
+
+        Concept:
+
+            The wheel client sends `positions` because it may update one servo
+            or several servos.  The rosbridge helper sends the final ROS message
+            using the field name `position`, because that is the message shape
+            expected by the servo controller.
+
+        Function-call syntax:
+
+            valid, payload_or_error = self._validate_arm_pose(body)
+            robot_status = self._post_to_robot(payload_or_error["mapped"], self.robot.arm_pose_path)
+
+        Dictionary update syntax:
+
+            self.arm_positions.update(payload_or_error["positions"])
+
+        ## TODO
+        Complete the servo-arm submit flow:
+
+            1. Call `_validate_arm_pose(body)`.
+            2. Return status 400 when validation fails.
+            3. POST the mapped payload to `self.robot.arm_pose_path`.
+            4. Save the accepted servo positions in `self.arm_positions`.
+            5. Save the robot status and command counters.
+            6. Return status 202 with accepted state.
+        """
+        return 501, {"error": "servo arm movement TODO"}
+
+    def arm_snapshot(self) -> Dict[str, Any]:
+        """
+        Return the current servo-arm state.
+
+        Concept:
+
+            This is the arm version of `snapshot()`.  It gives the REST layer a
+            dictionary that can be returned from:
+
+                GET /ric/v1/arm/state
+
+        Dictionary-comprehension syntax:
+
+            {str(k): {"min": v[0], "max": v[1]} for k, v in DEFAULT_ARM_LIMITS.items()}
+
+        ## TODO
+        Include:
+
+            - current servo positions
+            - allowed servo limits
+            - default servo positions
+            - last robot status
+            - last command timestamp
+            - command count
+            - last error
+        """
+        with self.lock:
+            return {
+                "positions": self.arm_positions.copy(),
+                "limits": {str(k): {"min": v[0], "max": v[1]} for k, v in DEFAULT_ARM_LIMITS.items()},
+                "defaults": DEFAULT_ARM_POSITIONS.copy(),
+                "state": {
+                    "last_robot_status": self.arm_last_robot_status,
+                    "last_command_ms": self.arm_last_command_ms,
+                    "command_count": self.arm_command_count,
+                    "last_error": self.arm_last_error,
+                },
+            }
+
+    def _validate_arm_pose(self, body: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Validate and map a servo-arm pose body.
+
+        Concept:
+
+            Validation checks outside input before it is sent to the robot.
+            Mapping changes the xApp-facing shape into the robot-facing shape.
+
+        Input field syntax:
+
+            positions = body.get("positions", body.get("position"))
+            duration = float(body.get("duration", 0.3))
+
+        Loop syntax:
+
+            for item in positions:
+                servo_id = int(item["id"])
+                value = int(round(float(item["position"])))
+
+        Clamp syntax:
+
+            lower, upper = DEFAULT_ARM_LIMITS[servo_id]
+            bounded = min(max(value, lower), upper)
+
+        Mapped payload shape:
+
+            {
+                "duration": duration,
+                "position_unit": "pulse",
+                "position": [
+                    {"id": servo_id, "position": value}
+                ]
+            }
+
+        ## TODO
+        Complete servo-arm validation and mapping.
+        """
+        return False, {"error": "servo arm validation TODO"}
+
     def video_snapshot(self) -> Tuple[int, bytes, str]:
         """
         Read one camera image from the robot-side video endpoint.
@@ -472,8 +615,7 @@ class SteeringCommandService:
             body = json.dumps({"error": "message"}, sort_keys=True).encode("utf-8")
             return 502, body, "application/json"
 
-        ## TODO
-        Complete the video snapshot flow:
+        Completed video snapshot flow:
 
             1. Return JSON error bytes when `self.robot.base_url` is blank.
             2. Build the URL from `self.robot.base_url` and `self.robot.video_snapshot_path`.
@@ -481,8 +623,21 @@ class SteeringCommandService:
             4. Return status code, raw image bytes, and Content-Type.
             5. Catch `requests.RequestException` and return a 502 JSON error.
         """
-        body = json.dumps({"error": "video snapshot TODO"}, sort_keys=True).encode("utf-8")
-        return 501, body, "application/json"
+        if not self.robot.base_url:
+            body = json.dumps({"error": "robot baseUrl is not configured"}, sort_keys=True).encode("utf-8")
+            return 503, body, "application/json"
+
+        path = self.robot.video_snapshot_path
+        url = f"{self.robot.base_url}{path if path.startswith('/') else '/' + path}"
+        try:
+            response = requests.get(url, timeout=max(self.robot.timeout_seconds, 2.0))
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+            return response.status_code, response.content, content_type
+        except requests.RequestException as exc:
+            if self.logger is not None:
+                self.logger.error(f"robot video snapshot GET failed: {exc}")
+            body = json.dumps({"error": "robot video snapshot failed", "detail": str(exc), "url": url}, sort_keys=True).encode("utf-8")
+            return 502, body, "application/json"
 
     def video_stream_url(self) -> str:
         """
@@ -504,10 +659,10 @@ class SteeringCommandService:
             path = self.robot.video_snapshot_path
             return f"{self.robot.base_url}{path if path.startswith('/') else '/' + path}"
 
-        ## TODO
-        Return the full robot-side video stream URL.
+        Completed URL builder.
         """
-        return ""
+        path = self.robot.video_stream_path
+        return f"{self.robot.base_url}{path if path.startswith('/') else '/' + path}"
 
     def _validate_and_normalize(self, body: Dict[str, Any], received_ms: int) -> Tuple[bool, Dict[str, Any]]:
         """

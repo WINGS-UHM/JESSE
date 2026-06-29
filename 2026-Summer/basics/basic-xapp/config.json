@@ -25,13 +25,16 @@
       "clampInputs": true
     },
     "robot": {
-      "baseUrl": "",
-      "commandPath": "/controller/cmd_vel",
-      "stopPath": "/controller/cmd_vel",
-      "timeoutSeconds": 0.2,
-      "payloadFormat": "rosorin_twist",
-      "maxLinearMps": 0.6,
-      "maxAngularRadps": 1.0
+      "baseUrl": "http://10.233.56.235:8090",
+      "commandPath": "/cmd_vel",
+      "stopPath": "/cmd_vel",
+      "videoSnapshotPath": "/video/snapshot",
+      "videoStreamPath": "/video/stream",
+      "armPosePath": "/arm/pose",
+      "timeoutSeconds": 4.0,
+      "payloadFormat": "ros_twist",
+      "maxLinearMps": 0.2,
+      "maxAngularRadps": 0.5
     }
   },
   "messaging": {

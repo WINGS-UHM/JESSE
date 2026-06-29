@@ -68,6 +68,12 @@ DEFAULT_WHEEL_CONFIG = {
     "right_paddle_button": 5,
     "enable_button": -1,
     "stop_button": -1,
+    "arm_enabled": True,
+    "arm_buttons": "5,4,7,11,6,10",
+    "arm_step": 10,
+    "arm_repeat_hz": 5.0,
+    "arm_duration": 0.2,
+    "clutch_reverse_threshold": 0.5,
     "steering_deadzone": 0.03,
     "pedal_idle_deadzone": 0.05,
 }
@@ -91,8 +97,10 @@ Button index concept:
     no wheel button is used as the stop button.
 
 Video settings are included in the dictionary so the command-line parser and
-client object have a clear place to attach video work.  The video methods lower
-in the file are the remaining TODO sections.
+client object have a clear place to attach video work.
+
+Servo-arm settings are also included here.  The arm buttons string maps six
+button indexes onto six servo ids in the same order as `ARM_SERVO_IDS`.
 """
 
 
@@ -110,6 +118,25 @@ PEDAL_IDLE_DEADZONE = DEFAULT_WHEEL_CONFIG["pedal_idle_deadzone"]
 
 AXIS_PRECISION = 3
 AXIS_NAMES = ("S", "A", "B", "C")
+
+# Servo-arm mapping.
+#
+# Concept:
+#
+#     A repeated mapping connects each physical button to one servo id.  The
+#     complete reference uses six ids.  One complete default line is shown here;
+#     add or adjust the remaining values by following `wheel_client_og.py`.
+#
+# Tuple syntax:
+#
+#     ARM_SERVO_IDS = (1, 2, 3, 4, 5, 10)
+#
+# Dictionary syntax:
+#
+#     servo_id: value
+ARM_SERVO_IDS = (1, 2, 3, 4, 5, 10)
+ARM_DEFAULT_POSITIONS = {1: 500}
+ARM_LIMITS = {1: (100, 1000)}
 
 
 # ---------------------------------------------------------------------------
@@ -416,12 +443,16 @@ class WheelClient:
         self.command_url = base + "/ric/v1/steering/command"
         self.stop_url = base + "/ric/v1/steering/stop"
         self.video_url = args.video_url or (base + "/ric/v1/video/stream")
+        self.arm_url = base + "/ric/v1/arm/pose"
         self.video_lock = threading.Lock()
         self.video_frame: Optional[bytes] = None
         self.video_frame_id = 0
         self.video_drawn_id = -1
         self.video_window_started = False
         self.video_thread: Optional[threading.Thread] = None
+        self.arm_positions = ARM_DEFAULT_POSITIONS.copy()
+        self.arm_buttons = dict(zip(ARM_SERVO_IDS, args.arm_buttons))
+        self.arm_next_send = {servo_id: 0.0 for servo_id in ARM_SERVO_IDS}
 
     def run(self) -> None:
         """
@@ -513,6 +544,7 @@ class WheelClient:
                 self.draw_video_frame()
                 axes, buttons, hats = read_state(joystick)
                 now = time.monotonic()
+                self.process_arm_buttons(axes, buttons, now)
                 if now >= next_send:
                     command = self.build_command(axes, buttons)
                     response = self._post_json(self.command_url, command)
@@ -552,10 +584,14 @@ class WheelClient:
 
             print(f"Video window started from {self.video_url}")
 
-        ## TODO
-        Complete the video startup logic.
+        Completed video startup flow.
         """
-        print("video streaming TODO: start_video")
+        self.video_window_started = True
+        pygame.display.set_caption("Robot camera")
+        pygame.display.set_mode((640, 480), pygame.RESIZABLE)
+        self.video_thread = threading.Thread(target=self.video_loop, daemon=True)
+        self.video_thread.start()
+        print(f"Video window started from {self.video_url}")
 
     def handle_pygame_events(self) -> None:
         """
@@ -572,10 +608,11 @@ class WheelClient:
                 if event.type == pygame.QUIT:
                     self.keep_running = False
 
-        ## TODO
-        Complete video window event handling.
+        Completed video window event handling.
         """
-        pygame.event.pump()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.keep_running = False
 
     def video_loop(self) -> None:
         """
@@ -586,9 +623,11 @@ class WheelClient:
             A snapshot URL returns one image per GET request.  A stream URL
             keeps one HTTP response open and sends many image parts.
 
-        ## TODO
-        Decide whether `self.video_url` is a stream or snapshot URL and call
-        the matching helper.
+        Completed flow:
+
+            1. Use the stream helper when the URL contains `/stream`.
+            2. Otherwise read snapshot images at `video_fps`.
+            3. Store each new frame behind `self.video_lock`.
 
         Stream check example:
 
@@ -609,7 +648,19 @@ class WheelClient:
                 self.video_frame = frame
                 self.video_frame_id += 1
         """
-        return
+        if "/stream" in self.video_url:
+            self.video_stream_loop()
+            return
+        frame_interval = 1.0 / self.args.video_fps
+        while self.keep_running:
+            started = time.monotonic()
+            frame = self._get_bytes(self.video_url, timeout=self.args.video_timeout)
+            if frame:
+                with self.video_lock:
+                    self.video_frame = frame
+                    self.video_frame_id += 1
+            elapsed = time.monotonic() - started
+            time.sleep(max(frame_interval - elapsed, 0.001))
 
     def video_stream_loop(self) -> None:
         """
@@ -627,9 +678,12 @@ class WheelClient:
                 headers={"Accept": "multipart/x-mixed-replace,image/jpeg"},
             )
 
-        ## TODO
-        Open the stream, read chunks, and pass bytes into
-        `extract_multipart_frames`.
+        Completed flow:
+
+            1. Open the stream URL.
+            2. Read chunks from the HTTP response.
+            3. Add each chunk to the local buffer.
+            4. Extract complete frames from that buffer.
 
         Open-response syntax:
 
@@ -645,7 +699,25 @@ class WheelClient:
             buffer += chunk
             buffer = self.extract_multipart_frames(buffer, boundary)
         """
-        return
+        request = urllib.request.Request(
+            self.video_url,
+            headers={"Accept": "multipart/x-mixed-replace,image/jpeg,image/x-portable-pixmap,image/x-portable-graymap"},
+        )
+        while self.keep_running:
+            try:
+                with urllib.request.urlopen(request, timeout=self.args.video_timeout) as response:
+                    boundary = self.multipart_boundary(response.headers.get("Content-Type", "")) or b"--frame"
+                    buffer = b""
+                    while self.keep_running:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        buffer = self.extract_multipart_frames(buffer, boundary)
+            except Exception as exc:
+                if self.keep_running:
+                    print(f"video stream failed: {exc}; retrying")
+                    time.sleep(1.0)
 
     def draw_video_frame(self) -> None:
         """
@@ -656,9 +728,12 @@ class WheelClient:
             `pygame.image.load(io.BytesIO(frame))` turns image bytes into a
             pygame image surface.  The surface can then be scaled and drawn.
 
-        ## TODO
-        Decode `self.video_frame`, scale it to the window size, draw it, and
-        call `pygame.display.flip()`.
+        Completed draw flow:
+
+            1. Read the newest frame under the lock.
+            2. Decode the image bytes with pygame.
+            3. Scale the image to the current window size.
+            4. Draw it and flip the display.
 
         Lock-and-skip syntax:
 
@@ -675,6 +750,76 @@ class WheelClient:
             scaled = pygame.transform.smoothscale(image.convert(), window.get_size())
             window.blit(scaled, (0, 0))
             pygame.display.flip()
+        """
+        if not self.args.video or not self.video_window_started:
+            return
+        with self.video_lock:
+            if self.video_frame is None or self.video_frame_id == self.video_drawn_id:
+                return
+            frame = self.video_frame
+            frame_id = self.video_frame_id
+        try:
+            image = pygame.image.load(io.BytesIO(frame))
+            window = pygame.display.get_surface()
+            if window is None:
+                return
+            scaled = pygame.transform.smoothscale(image.convert(), window.get_size())
+            window.blit(scaled, (0, 0))
+            pygame.display.flip()
+            self.video_drawn_id = frame_id
+        except pygame.error as exc:
+            print(f"video frame decode failed: {exc}")
+            self.video_drawn_id = frame_id
+
+    def process_arm_buttons(self, axes: Sequence[float], buttons: Sequence[int], now: float) -> None:
+        """
+        Read wheel buttons and send servo-arm pose commands.
+
+        Concept:
+
+            The driving command uses axes every loop.  The arm command uses
+            buttons.  Holding a button should move one servo by a small step,
+            wait for the repeat interval, then allow another step.
+
+        Reverse-control concept:
+
+            The clutch pedal can reverse button direction.  For example, the
+            same button can increase a servo position normally and decrease it
+            while the clutch is held past the threshold.
+
+        Function-call syntax:
+
+            reverse = normalize_pedal(axis_value(axes, self.args.clutch_axis, 1.0)) >= self.args.clutch_reverse_threshold
+            button_value(buttons, button_index)
+            clamp(current + direction * self.args.arm_step, lower, upper)
+            response = self._post_json(self.arm_url, payload)
+
+        Repeated loop syntax:
+
+            for servo_id, button_index in self.arm_buttons.items():
+                ...
+
+        Payload shape:
+
+            payload = {
+                "duration": self.args.arm_duration,
+                "positions": [
+                    {"id": servo_id, "position": updated}
+                ],
+            }
+
+        ## TODO
+        Complete servo-arm button handling:
+
+            1. Return immediately when `self.args.arm_enabled` is false.
+            2. Calculate whether clutch input means reverse direction.
+            3. Calculate `repeat_interval = 1.0 / self.args.arm_repeat_hz`.
+            4. Loop over `self.arm_buttons.items()`.
+            5. Skip buttons that are disabled, not pressed, or still waiting.
+            6. Clamp the updated servo position between its min/max limits.
+            7. Save the new position and next send time.
+            8. POST the payload to `self.arm_url`.
+            9. Print command and response details when requested.
         """
         return
 
@@ -924,8 +1069,7 @@ class WheelClient:
             Images are bytes, so this helper returns `bytes` instead of a JSON
             dictionary.
 
-        ## TODO
-        Use `urllib.request.urlopen` to read one snapshot image.
+        Completed snapshot fetch helper.
 
         Request syntax:
 
@@ -943,6 +1087,22 @@ class WheelClient:
         `urllib.error.URLError`, `TimeoutError`, and `OSError` structure used in
         `_post_json`.
         """
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "image/jpeg,image/png,image/x-portable-pixmap,image/x-portable-graymap"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            print(f"GET {url} returned {exc.code}: {body[:200]}")
+        except urllib.error.URLError as exc:
+            print(f"GET {url} failed: {exc}")
+        except TimeoutError as exc:
+            print(f"GET {url} timed out: {exc}")
+        except OSError as exc:
+            print(f"GET {url} failed: {exc}")
         return None
 
     def extract_multipart_frames(self, buffer: bytes, boundary: bytes) -> bytes:
@@ -955,9 +1115,7 @@ class WheelClient:
             should keep unfinished bytes in `buffer` and only store complete
             image frames.
 
-        ## TODO
-        Search for the boundary marker, split complete parts, and store the
-        newest image bytes in `self.video_frame`.
+        Completed multipart parser.
 
         Boundary search syntax:
 
@@ -975,7 +1133,23 @@ class WheelClient:
                 self.video_frame = frame
                 self.video_frame_id += 1
         """
-        return buffer
+        while True:
+            start = buffer.find(boundary)
+            if start < 0:
+                return buffer[-len(boundary):]
+            next_start = buffer.find(boundary, start + len(boundary))
+            if next_start < 0:
+                return buffer[start:]
+            part = buffer[start + len(boundary):next_start].strip(b"\r\n")
+            buffer = buffer[next_start:]
+            header_end = part.find(b"\r\n\r\n")
+            if header_end < 0:
+                continue
+            frame = part[header_end + 4:].strip(b"\r\n")
+            if frame:
+                with self.video_lock:
+                    self.video_frame = frame
+                    self.video_frame_id += 1
 
     @staticmethod
     def multipart_boundary(content_type: str) -> Optional[bytes]:
@@ -986,9 +1160,7 @@ class WheelClient:
 
             multipart/x-mixed-replace; boundary=frame
 
-        ## TODO
-        Parse the `boundary=...` value and return it as bytes with a leading
-        `--`.
+        Completed boundary parser.
 
         Header parsing syntax:
 
@@ -1002,6 +1174,13 @@ class WheelClient:
                 token = "--" + token
             return token.encode("ascii", "ignore")
         """
+        for item in content_type.split(";"):
+            key, _, value = item.strip().partition("=")
+            if key.lower() == "boundary" and value:
+                token = value.strip().strip('"')
+                if not token.startswith("--"):
+                    token = "--" + token
+                return token.encode("ascii", "ignore")
         return None
 
     @staticmethod
@@ -1044,8 +1223,8 @@ def parse_args() -> argparse.Namespace:
 
     Concept:
 
-        The movement arguments are complete.  The video arguments are present
-        so the remaining video TODO methods have command-line settings to use.
+        The movement and video arguments are complete.  The arm arguments are
+        present so the servo-arm TODO method has command-line settings to use.
     """
     parser = argparse.ArgumentParser(description="Logitech wheel client for the steering xApp")
     parser.add_argument(
@@ -1066,8 +1245,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steering-axis", type=int, default=DEFAULT_WHEEL_CONFIG["steering_axis"])
     parser.add_argument("--throttle-axis", type=int, default=DEFAULT_WHEEL_CONFIG["throttle_axis"])
     parser.add_argument("--brake-axis", type=int, default=DEFAULT_WHEEL_CONFIG["brake_axis"])
+    parser.add_argument("--clutch-axis", type=int, default=DEFAULT_WHEEL_CONFIG["clutch_axis"])
     parser.add_argument("--enable-button", type=int, default=DEFAULT_WHEEL_CONFIG["enable_button"], help="Button that must be held; -1 always enables")
     parser.add_argument("--stop-button", type=int, default=DEFAULT_WHEEL_CONFIG["stop_button"], help="Button that stops the client and sends xApp stop")
+    parser.add_argument("--arm-enabled", dest="arm_enabled", action="store_true", default=DEFAULT_WHEEL_CONFIG["arm_enabled"])
+    parser.add_argument("--no-arm", dest="arm_enabled", action="store_false", help="Disable arm button controls")
+    parser.add_argument("--arm-buttons", default=DEFAULT_WHEEL_CONFIG["arm_buttons"], help="Comma-separated buttons for servo ids 1,2,3,4,5,10")
+    parser.add_argument("--arm-step", type=int, default=DEFAULT_WHEEL_CONFIG["arm_step"], help="Servo pulse step per arm repeat")
+    parser.add_argument("--arm-repeat-hz", type=float, default=DEFAULT_WHEEL_CONFIG["arm_repeat_hz"], help="Arm button hold repeat rate")
+    parser.add_argument("--arm-duration", type=float, default=DEFAULT_WHEEL_CONFIG["arm_duration"], help="Arm servo command duration seconds")
+    parser.add_argument("--clutch-reverse-threshold", type=float, default=DEFAULT_WHEEL_CONFIG["clutch_reverse_threshold"], help="Normalized clutch value that reverses arm button direction")
     parser.add_argument("--steering-deadzone", type=float, default=DEFAULT_WHEEL_CONFIG["steering_deadzone"])
     parser.add_argument("--pedal-idle-deadzone", type=float, default=DEFAULT_WHEEL_CONFIG["pedal_idle_deadzone"])
     parser.add_argument("--invert-steering", action="store_true")
@@ -1079,7 +1266,42 @@ def parse_args() -> argparse.Namespace:
         parser.error("--rate-hz must be greater than 0")
     if args.video_fps <= 0:
         parser.error("--video-fps must be greater than 0")
+    if args.arm_repeat_hz <= 0:
+        parser.error("--arm-repeat-hz must be greater than 0")
+    args.arm_buttons = parse_int_list(args.arm_buttons, expected=6, parser=parser, name="--arm-buttons")
     return args
+
+
+def parse_int_list(value: str, expected: int, parser: argparse.ArgumentParser, name: str) -> List[int]:
+    """
+    Convert a comma-separated string into a list of integers.
+
+    Example:
+
+        "5,4,7,11,6,10" -> [5, 4, 7, 11, 6, 10]
+
+    Concept:
+
+        Command-line arguments arrive as text.  The arm button map needs button
+        indexes as integers, so each comma-separated piece must be converted
+        with `int(...)`.
+
+    List-comprehension syntax:
+
+        items = [int(item.strip()) for item in value.split(",")]
+
+    Length check syntax:
+
+        if len(items) != expected:
+            parser.error(...)
+    """
+    try:
+        items = [int(item.strip()) for item in value.split(",")]
+    except ValueError:
+        parser.error(f"{name} must be a comma-separated list of integers")
+    if len(items) != expected:
+        parser.error(f"{name} must contain {expected} integers")
+    return items
 
 
 # ---------------------------------------------------------------------------

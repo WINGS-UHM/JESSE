@@ -1,5 +1,5 @@
-# Build from the parent xapp directory:
-# docker build --network=host -f basic-xapp/Dockerfile -t registry.local:5000/steering-wheel-command-xapp:1.0.0 .
+# Build from inside this application directory:
+# docker build --network=host -t registry.local:5000/steering-wheel-command-xapp:1.0.0 .
 
 FROM python:3.10-slim
 
@@ -24,21 +24,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && if [ -e /usr/lib/x86_64-linux-musl/libc.so ]; then ln -sf /usr/lib/x86_64-linux-musl/libc.so /lib/libc.musl-x86_64.so.1; fi \
     && mkdir -p /opt/ric/config \
     && pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir ricxappframe pygame numpy \
+    && pip install --no-cache-dir ricxappframe pygame numpy websocket-client \
     && apt-get purge -y --auto-remove wget \
     && rm -rf /var/lib/apt/lists/*
 
-COPY basic-xapp/steering_xapp.py /opt/xapp/
-COPY basic-xapp/steering_service.py /opt/xapp/
-COPY basic-xapp/wheel_client.py /opt/xapp/
-COPY basic-xapp/forwarder_helper.py /opt/xapp/
-COPY basic-xapp/xapp-descriptor.json /opt/xapp/
-COPY basic-xapp/routes.txt /opt/xapp/
-COPY basic-xapp/README.md /opt/xapp/
+COPY steering_xapp.py /opt/xapp/
+COPY steering_service.py /opt/xapp/
+COPY wheel_client.py /opt/xapp/
+COPY rosbridge_forwarder.py /opt/xapp/
+COPY xapp-descriptor.json /opt/xapp/
+COPY routes.txt /opt/xapp/
+COPY README.md /opt/xapp/
 
 # Keep a fallback copy in the image.
 # Kubernetes/Helm may still override /opt/ric/config with a mounted ConfigMap.
-COPY basic-xapp/config.json /opt/ric/config/config-file.json
+COPY config.json /opt/ric/config/config-file.json
 
 EXPOSE 8080 4562
 
