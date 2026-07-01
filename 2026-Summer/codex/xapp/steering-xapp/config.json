@@ -1,0 +1,62 @@
+{
+  "name": "steering-xapp",
+  "xapp_name": "steering-xapp",
+  "version": "1.0.0",
+  "json_url": "steering-xapp",
+  "APP_NAMESPACE": "ricxapp",
+  "CONFIG_PATH": "/ric/v1/config",
+  "controls": {
+    "restHost": "0.0.0.0",
+    "restPort": 8080,
+    "rmrPort": 4562,
+    "waitForRmrReady": false,
+    "useFakeSdl": false,
+    "commandRateHz": 20.0,
+    "deadmanTimeoutMs": 500,
+    "bounds": {
+      "steeringMin": -1.0,
+      "steeringMax": 1.0,
+      "throttleMin": 0.0,
+      "throttleMax": 1.0,
+      "brakeMin": 0.0,
+      "brakeMax": 1.0,
+      "clampInputs": true
+    },
+    "robot": {
+      "baseUrl": "http://10.233.56.235:8090",
+      "commandPath": "/cmd_vel",
+      "stopPath": "/cmd_vel",
+      "videoSnapshotPath": "/video/snapshot",
+      "videoStreamPath": "/video/stream",
+      "armPosePath": "/arm/pose",
+      "timeoutSeconds": 4.0,
+      "payloadFormat": "ros_twist",
+      "maxLinearMps": 0.2,
+      "maxAngularRadps": 0.5
+    }
+  },
+  "messaging": {
+    "ports": [
+      {
+        "name": "http",
+        "container": "steering-xapp",
+        "port": 8080,
+        "description": "REST API port for config, health, and steering command handlers"
+      },
+      {
+        "name": "rmr-data",
+        "container": "steering-xapp",
+        "port": 4562,
+        "description": "RMR port kept for xApp framework health and registration behavior"
+      }
+    ]
+  },
+  "rmr": {
+    "maxSize": 2072,
+    "numWorkers": 1,
+    "policies": [],
+    "protPort": "tcp:4562",
+    "rxMessages": [],
+    "txMessages": []
+  }
+}
