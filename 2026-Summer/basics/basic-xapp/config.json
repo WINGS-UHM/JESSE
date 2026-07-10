@@ -1,8 +1,8 @@
 {
-  "name": "steering-xapp",
-  "xapp_name": "steering-xapp",
+  "name": "steering-wheel-command-xapp",
+  "xapp_name": "steering-wheel-command-xapp",
   "version": "1.0.0",
-  "json_url": "steering-xapp",
+  "json_url": "steering-wheel-command-xapp",
   "APP_NAMESPACE": "ricxapp",
   "CONFIG_PATH": "/ric/v1/config",
   "controls": {
@@ -13,6 +13,8 @@
     "useFakeSdl": false,
     "commandRateHz": 20.0,
     "deadmanTimeoutMs": 500,
+    "maxCommandAgeMs": 1000,
+    "maxFutureSkewMs": 250,
     "bounds": {
       "steeringMin": -1.0,
       "steeringMax": 1.0,
@@ -39,13 +41,13 @@
     "ports": [
       {
         "name": "http",
-        "container": "steering-xapp",
+        "container": "steering-wheel-command-xapp",
         "port": 8080,
         "description": "REST API port for config, health, and steering command handlers"
       },
       {
         "name": "rmr-data",
-        "container": "steering-xapp",
+        "container": "steering-wheel-command-xapp",
         "port": 4562,
         "description": "RMR port kept for xApp framework health and registration behavior"
       }

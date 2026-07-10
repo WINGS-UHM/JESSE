@@ -1,5 +1,5 @@
-# Build from inside the steering-xapp directory:
-# docker build --network=host -t registry.local:5000/steering-xapp:1.0.0 .
+# Build from inside this application directory:
+# docker build --network=host -t registry.local:5000/steering-wheel-command-xapp:1.0.0 .
 
 FROM python:3.10-slim
 
@@ -31,9 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY steering_xapp.py /opt/xapp/
 COPY steering_service.py /opt/xapp/
 COPY wheel_client.py /opt/xapp/
-COPY forwarder_helper.py /opt/xapp/
 COPY rosbridge_forwarder.py /opt/xapp/
+COPY xapp-descriptor.json /opt/xapp/
 COPY routes.txt /opt/xapp/
+COPY README.md /opt/xapp/
 
 # Keep a fallback copy in the image.
 # Kubernetes/Helm may still override /opt/ric/config with a mounted ConfigMap.
